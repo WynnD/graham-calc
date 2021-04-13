@@ -3,6 +3,7 @@ import sys
 import asyncio
 import errno
 import pandas as pd
+import logging
 import FundamentalAnalysis as fa
 import yfinance as yf
 from tqdm import tqdm
@@ -20,6 +21,8 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 datestring = datetime.now().strftime("%Y_%m_%d")
+logger = logging.getLogger()
+logging.basicConfig(filename=f'graham_run_{datestring}.log')
 API_KEY = os.environ['API_KEY']
 REDIS_PASS = os.environ['REDIS_PASS']
 r = redis.Redis(host='192.168.0.201', password=REDIS_PASS)
@@ -28,14 +31,16 @@ def storeInRedis(key, dataframe):
     df_compressed = pa.serialize(dataframe).to_buffer().to_pybytes()
     res = r.set(key, df_compressed)
     if res == True:
-        print(f'{key} cached')
+        logger.debug(f"'{key}' cached in redis")
+    else:
+        logger.error(f"Failed to insert '{key}' with value of size {len(df_compressed)} ")
 
 def loadFromRedis(key):
     data = r.get(key)
     try:
         return pa.deserialize(data)
     except:
-        print("No data")
+        logger.debug(f"No data for '{key}' in redis or value is not deserializable")
 
 class CachedFA:
 
@@ -163,71 +168,83 @@ results = []
 
 def doProcess(ticker):
     # get market cap and filter
+    result_string = ''
     try:
         cap = getCap(ticker)
+        if not cap:
+            logger.debug(f"missing market cap data for ticker {ticker}")
+            return None
         avg3yrPE = get3YrAvgPE(ticker)
+        if not avg3yrPE:
+            logger.debug(f"missing P/E data for ticker {ticker}")
+            return None
         currentRatio = getCR(ticker)
+        if not currentRatio:
+            logger.debug(f"Missing Current ratio for ticker {ticker}")
+            return None
         dividend = getDividendYield(ticker)
+        if not dividend:
+            logger.debug(f"missing dividend data for ticker {ticker}")
+            return None
+        priceToBook = getPriceBookRatio(ticker)
+        if not priceToBook:
+            logger.debug(f"missing P/B ratio for ticker {ticker}")
+            return None
         earningsPositive = isEarningsPositiveFor10Yrs(ticker)
         earningsGrowthPercent = earningsPercentGrowthInTenYears(ticker)
-        priceToBook = getPriceBookRatio(ticker)
+        peTimesPb = priceToBook * avg3yrPE
     except Exception as e:
-        print(f"Failed to process {ticker}")
-        traceback.print_exc()
-        return None
-    if not cap:
-        print("missing market cap data")
-        return None
-    elif not avg3yrPE:
-        print("missing P/E data")
-        return None
-    elif not dividend:
-        print("missing dividend data")
-        return None
-    elif not priceToBook:
-        print("missing P/B ratio")
-        return None
-    elif not currentRatio:
-        print("Missing Current ratio")
+        logger.debug(f"Failed to process {ticker}")
+        logger.debug(traceback.format_exc())
         return None
     else:
-        print(f"Ticker: {ticker.upper()}    mktCap: {cap}   3yr Avg P/E: {avg3yrPE}     CurrentRatio: {currentRatio}    Current Div: {dividend} P/B: {priceToBook}")
+        result_string = f"""Ticker: {ticker.upper()}
+mktCap: {cap}
+3yr Avg P/E: {avg3yrPE:.2f}
+CurrentRatio: {currentRatio:.2f}
+Current Div: {dividend:.2f}%
+P/B: {priceToBook:.2f}
+P/B * P/E: {peTimesPb:.2f}"""
+
+        logger.debug(result_string)
+        logger.info(f"Ticker: {ticker.upper()} fundamentals successfully acquired.")
 
     if cap < 2000000000:
-        print("Cap too small")
-    elif avg3yrPE > 15:
-        print("PE too high")
+        logger.info(f"Cap too small for ticker {ticker}")
+    elif priceToBook > 1.5 and peTimesPb > 22.5:
+        logger.info(f"Price to book too large for ticker {ticker}")
+    elif avg3yrPE > 15 or avg3yrPE < 0:
+        logger.info(f"3 yr average PE does not qualify {ticker}")
     elif currentRatio and currentRatio < 2:
-        print("Current ratio too low")
+        logger.info(f"Current ratio too low for ticker {ticker}")
     elif dividend == 0:
-        print("No dividend")
+        logger.info(f"No dividend for ticker {ticker}")
     elif not earningsPositive:
-        print("Not earnings positive")
-    elif priceToBook > 1.5:
-        print("price to book too large")
+        logger.info(f"Not earnings positive for ticker {ticker}")
+
     elif earningsGrowthPercent < 33.3:
-        print("earnings growth too low")
+        logger.info(f"Earnings growth too low for ticker {ticker}")
     else:
-        print(f"We have a winner: {ticker.upper()}")
+        logger.info(f"""We have a winner:
+{result_string}""")
         results.append(ticker)
-        r.sadd(f"results_set_{datestring}", ticker)
+        r.sadd(f"results_{datestring}", ticker)
+        r.hset(f"results_data_{datestring}", key=ticker, value=result_string)
     return None
 
 async def main():
     loop = asyncio.get_event_loop()
     stocklist = cfa.available_companies()
     tickers = list(stocklist.index)
-    executor = ThreadPoolExecutor(max_workers=50)
+    executor = ThreadPoolExecutor()
     futures = []
     for ticker in tickers:
         futures.append(
             loop.run_in_executor(executor, doProcess, ticker))
     [await f for f in tqdm(asyncio.as_completed(futures), total=len(futures))]
 
-
 loop = asyncio.get_event_loop()
 loop.run_until_complete(main())
 for ticker in results:
-    print(ticker)
+    logger.info(ticker)
 loop.close()
-main()
